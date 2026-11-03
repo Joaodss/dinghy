@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# --- Frontend -------------------------------------------------------------
-FROM node:24-alpine AS web
+# --- Frontend (same output on every platform, so build it once natively) ----
+FROM --platform=$BUILDPLATFORM node:24-alpine AS web
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
@@ -20,19 +20,18 @@ COPY server/ ./
 COPY --from=web /src/web/dist /src/web/dist
 RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
-# --- Docker Compose CLI (standalone binary, no docker CLI needed) ---------
-FROM alpine:3.22 AS compose
-ARG COMPOSE_VERSION=v2.39.4
-ARG TARGETARCH
-RUN apk add --no-cache curl \
-    && case "${TARGETARCH:-amd64}" in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; *) echo "unsupported arch" && exit 1 ;; esac \
-    && cd /tmp \
-    && curl -fsSLO "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${arch}" \
-    && curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${arch}.sha256" | sha256sum -c - \
-    && install -m 0755 "docker-compose-linux-${arch}" /docker-compose
+# --- Docker Compose CLI (standalone; tracked by Dependabot) ----------------
+FROM docker/compose-bin:v5.7.0 AS compose
+
+# --- Bare binary, for release downloads (`--target binary`) ---------------
+FROM scratch AS binary
+COPY --from=server /src/server/target/release/dinghy /dinghy
 
 # --- Final image ------------------------------------------------------------
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot
+LABEL org.opencontainers.image.title="dinghy" \
+      org.opencontainers.image.description="A lightweight Docker Compose stack manager for a single server" \
+      org.opencontainers.image.source="https://github.com/Joaodss/dinghy"
 COPY --from=compose /docker-compose /usr/local/bin/docker-compose
 COPY --from=server /src/server/target/release/dinghy /usr/local/bin/dinghy
 ENV DINGHY_LISTEN=0.0.0.0:5002 \

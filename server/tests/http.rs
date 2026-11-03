@@ -103,7 +103,10 @@ fn harness() -> Harness {
     let verifier =
         AccessVerifier::with_keys(config.access.clone().unwrap(), JwkSet { keys: vec![jwk] });
 
-    let docker = Docker::connect_with_defaults().unwrap();
+    // None of these tests reach Docker; an HTTP client connects lazily, so the
+    // tests run without a Docker socket.
+    let docker =
+        Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION).unwrap();
     let state = Arc::new(AppState::new(config, docker, Some(verifier)));
     Harness {
         _dir: dir,

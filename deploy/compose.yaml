@@ -1,0 +1,38 @@
+# dinghy with Docker Compose.
+#
+#   cp dinghy.env.example dinghy.env   # then fill it in
+#   echo "DOCKER_GID=$(stat -c %g /var/run/docker.sock)" > .env
+#   docker compose up -d
+#
+# Keep this file outside the stacks directory, so dinghy does not list itself
+# (and cannot stop itself with "Down").
+
+services:
+  dinghy:
+    image: ghcr.io/joaodss/dinghy:${DINGHY_VERSION:-0.1.0}
+    container_name: dinghy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+    # The group that owns /var/run/docker.sock on the host.
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID to the docker.sock group id}"
+    env_file: dinghy.env
+    environment:
+      # Stacks are mounted at the same path as on the host, so relative bind
+      # mounts in their compose files resolve correctly.
+      DINGHY_STACKS_DIR: ${STACKS_DIR:-/opt/stacks}
+      DINGHY_FILE_ROOTS: stacks=${STACKS_DIR:-/opt/stacks},scripts=${SCRIPTS_DIR:-/opt/scripts}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${STACKS_DIR:-/opt/stacks}:${STACKS_DIR:-/opt/stacks}
+      - ${SCRIPTS_DIR:-/opt/scripts}:${SCRIPTS_DIR:-/opt/scripts}
+    ports:
+      # Only reachable from the host; put Caddy (or another proxy) in front.
+      - "127.0.0.1:5002:5002"

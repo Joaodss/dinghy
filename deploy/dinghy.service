@@ -1,0 +1,38 @@
+# dinghy as a systemd service that runs the container with `docker run`, for
+# hosts without the Compose plugin (e.g. Container-Optimized OS).
+#
+# Replace 412 with the group id of /var/run/docker.sock
+# (`stat -c %g /var/run/docker.sock`); systemd does not run `$(...)`.
+
+[Unit]
+Description=dinghy Docker Compose stack manager
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=IMAGE=ghcr.io/joaodss/dinghy:0.1.0
+Environment=STACKS_DIR=/mnt/disks/data/stacks
+Environment=SCRIPTS_DIR=/mnt/disks/data/scripts
+Environment=ENV_FILE=/mnt/disks/data/dinghy/dinghy.env
+ExecStartPre=-/usr/bin/docker rm -f dinghy
+ExecStartPre=/usr/bin/docker pull ${IMAGE}
+ExecStart=/usr/bin/docker run --rm --name dinghy \
+  --read-only --tmpfs /tmp \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --memory 64m \
+  --group-add 412 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v ${STACKS_DIR}:${STACKS_DIR} \
+  -v ${SCRIPTS_DIR}:${SCRIPTS_DIR} \
+  -e DINGHY_STACKS_DIR=${STACKS_DIR} \
+  -e DINGHY_FILE_ROOTS=stacks=${STACKS_DIR},scripts=${SCRIPTS_DIR} \
+  --env-file ${ENV_FILE} \
+  -p 127.0.0.1:5002:5002 \
+  ${IMAGE}
+ExecStop=/usr/bin/docker stop -t 10 dinghy
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

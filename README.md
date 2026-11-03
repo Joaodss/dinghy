@@ -87,34 +87,65 @@ All settings are environment variables.
 Create the password hash (it reads one line from stdin):
 
 ```bash
-printf '%s' 'your password' | docker run --rm -i ghcr.io/joaodss/dinghy:latest hash-password
+printf '%s' 'your password' | docker run --rm -i ghcr.io/joaodss/dinghy:0.1.0 hash-password
 ```
 
-In an env file read by `docker run --env-file`, write the hash as is; that
-format does not expand `$`.
+In an env file read by `docker run --env-file` or Compose `env_file:`, write
+the hash as is; those formats do not expand `$`.
+
+## Install
+
+Images are on GitHub Container Registry, for `linux/amd64` and `linux/arm64`,
+with SBOM and provenance attestations:
+
+| Tag | Points to |
+| --- | --- |
+| `0.1.0` | That exact release. Pin this in production. |
+| `0.1` | The newest `0.1.x` patch release. |
+| `latest` | The newest release. |
+| `edge` | The tip of `master`. Not for production. |
+| `sha-<commit>` | One specific `master` commit. |
+
+Each [release](https://github.com/Joaodss/dinghy/releases) also ships static
+binaries (`dinghy-x86_64-linux-musl`, `dinghy-aarch64-linux-musl`) with the
+web UI embedded, plus `SHA256SUMS`. They need `docker compose` on the host.
+
+The [`deploy/`](deploy/) folder has ready-to-use files:
+
+- [`compose.yaml`](deploy/compose.yaml): run dinghy with Docker Compose.
+- [`dinghy.service`](deploy/dinghy.service): a systemd unit around `docker run`,
+  for hosts without the Compose plugin, such as Container-Optimized OS.
+- [`dinghy.env.example`](deploy/dinghy.env.example): the secrets to fill in.
+
+### With Docker Compose
+
+```bash
+cd deploy
+cp dinghy.env.example dinghy.env        # fill it in
+cat > .env <<EOF
+DOCKER_GID=$(stat -c %g /var/run/docker.sock)
+STACKS_DIR=/mnt/disks/data/stacks
+SCRIPTS_DIR=/mnt/disks/data/scripts
+EOF
+docker compose up -d
+```
+
+Keep `deploy/` outside the stacks directory, so dinghy does not list itself
+and cannot stop itself with **Down**. To upgrade, change `DINGHY_VERSION` in
+`.env` (or the tag in `compose.yaml`) and run `docker compose up -d` again.
 
 ## Deploying on noodle-server
 
-Bind mounts in compose files resolve against the project directory, and the
-Docker daemon reads those paths on the host. The simplest fix is to mount the
-stacks at the **same path** inside the container:
+Container-Optimized OS has no Compose plugin, so use
+[`deploy/dinghy.service`](deploy/dinghy.service) in place of `dockge.service`
+in the Terraform cloud-init (`locals.tf`). It pulls the pinned image, runs it
+hardened and restarts it if it stops. Set the socket's group id in
+`--group-add`. systemd does not run `$(…)`, so write the number from
+`stat -c %g /var/run/docker.sock`.
 
-```bash
-docker run --rm --name dinghy \
-  --network custom-bridge \
-  --read-only --tmpfs /tmp \
-  --cap-drop ALL --security-opt no-new-privileges \
-  --memory 64m \
-  --group-add "$(stat -c %g /var/run/docker.sock)" \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /mnt/disks/data/stacks:/mnt/disks/data/stacks \
-  -v /mnt/disks/data/scripts:/mnt/disks/data/scripts \
-  -e DINGHY_STACKS_DIR=/mnt/disks/data/stacks \
-  -e DINGHY_FILE_ROOTS=stacks=/mnt/disks/data/stacks,scripts=/mnt/disks/data/scripts \
-  --env-file /mnt/disks/data/dinghy/dinghy.env \
-  -p 127.0.0.1:5002:5002 \
-  ghcr.io/joaodss/dinghy:latest
-```
+Bind mounts in compose files resolve against the project directory, and the
+Docker daemon reads those paths on the host. Both deploy files therefore
+mount the stacks at the **same path** inside the container.
 
 If you keep the Dockge layout (`-v /mnt/disks/data/stacks:/opt/stacks`), set
 `DINGHY_STACKS_HOST_DIR=/mnt/disks/data/stacks`. dinghy then passes
@@ -131,22 +162,6 @@ Permissions, because the process is not root:
   not recursively, so data folders inside stacks keep their owners:
   `chown 65532 /mnt/disks/data/stacks /mnt/disks/data/stacks/*/ /mnt/disks/data/scripts`.
 
-`dinghy.env` holds the secrets:
-
-```
-DINGHY_PASSWORD_HASH=$argon2id$v=19$m=19456,t=2,p=1$...
-DINGHY_CF_TEAM=noodleserver
-DINGHY_CF_AUD=<aud tag>
-DINGHY_ALLOWED_EMAILS=you@example.com
-DINGHY_SESSION_SECRET=<openssl rand -hex 32>
-```
-
-For the systemd unit in the Terraform cloud-init (`locals.tf`), replace
-`dockge.service` with a `dinghy.service` whose `ExecStart` is the command
-above, plus `ExecStartPre=-/usr/bin/docker rm -f dinghy` and `Restart=always`.
-systemd does not run `$(…)`, so write the socket's numeric group id in
-`--group-add` there.
-
 ### Migrating from Dockge
 
 1. Run dinghy next to Dockge on another port and compare memory with
@@ -157,15 +172,17 @@ systemd does not run `$(…)`, so write the socket's numeric group id in
 
 ## Performance targets
 
-| Metric | Target | How to measure |
-| --- | --- | --- |
-| RAM at rest, no page open | ≤ 15 MB | `docker stats --no-stream dinghy`, 10 min after start |
-| RAM with one log stream open | ≤ 40 MB | same, with a container's logs open |
-| RAM 1 min after closing the page | back to rest + 2 MB | same, after closing the browser |
-| CPU at rest | ~0% | no polling without clients |
-| Image | ≤ 80 MB | `docker images dinghy` |
-| Binary | ≤ 15 MB | `ls -l` of the release binary |
-| Start-up | ≤ 1 s | time until `/healthz` answers `200` |
+Measured for 0.1.0 in the hardened container on Docker Desktop (Linux VM):
+
+| Metric | Target | Measured | How to measure |
+| --- | --- | --- | --- |
+| RAM at rest, no page open | ≤ 15 MB | 1.1 MiB | `docker stats --no-stream dinghy`, 10 min after start |
+| RAM with log streams open | ≤ 40 MB | ~1 MiB (3 streams) | same, with a container's logs open |
+| RAM after closing the page | rest + 2 MB | 0.9 MiB | same, after closing the browser |
+| CPU at rest | ~0% | 0.00% | no polling without clients |
+| Image | ≤ 80 MB | 43 MB | `docker images dinghy` |
+| Binary | ≤ 15 MB | 6 MB | `ls -l` of the release binary |
+| Start-up | ≤ 1 s | ~0.9 s | time until `/healthz` answers `200` |
 
 ## HTTP API
 
@@ -209,3 +226,39 @@ DINGHY_INSECURE_NO_ACCESS=1 DINGHY_STACKS_DIR=/path/to/stacks cargo run
 
 For frontend work, `npm run dev` in `web/` proxies `/api` to
 `127.0.0.1:5002`.
+
+To check a built image end to end (health, assets, sign-in, compose up and
+down, memory), as CI does:
+
+```bash
+docker build -t dinghy:dev . && scripts/smoke-test.sh dinghy:dev
+```
+
+## CI/CD and releases
+
+[`ci.yml`](.github/workflows/ci.yml) runs on every pull request and push:
+
+- **Web**: `npm ci`, `npm audit`, build.
+- **Server**: `cargo fmt`, `clippy -D warnings`, tests, `cargo audit`.
+- **Image**: build, [smoke test](scripts/smoke-test.sh), and a Trivy scan
+  that fails on fixable HIGH or CRITICAL vulnerabilities.
+
+Pushes to `master` then publish `edge` and `sha-*` images. Tags publish the
+release images and a GitHub release.
+[`security.yml`](.github/workflows/security.yml) repeats the audits and scans
+the published images every Monday, because advisories appear without code
+changes. [Dependabot](.github/dependabot.yml) opens weekly PRs for Rust and
+npm packages, the Dockerfile base images (including the Compose CLI) and the
+workflow actions.
+
+To release:
+
+1. Set the new version in `server/Cargo.toml` (run `cargo check` to update
+   `Cargo.lock`) and `web/package.json`.
+2. Move the `Unreleased` notes in `CHANGELOG.md` under a new
+   `## [X.Y.Z] - date` heading.
+3. Commit, then tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+CI refuses a tag that doesn't match both versions or has no changelog
+section. Tags with a suffix (`v1.0.0-rc.1`) become pre-releases and don't
+move `latest`.

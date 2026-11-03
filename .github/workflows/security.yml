@@ -1,0 +1,57 @@
+name: Security
+
+# New advisories appear without any code change, so this re-checks the
+# dependencies and the published image every week.
+
+on:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.75.0
+
+jobs:
+  dependencies:
+    name: Dependencies
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Rust advisories
+        working-directory: server
+        run: cargo audit
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: npm advisories
+        working-directory: web
+        run: npm audit --audit-level=high
+
+  image:
+    name: Published image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Scan latest and edge
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/dinghy"
+          status=0
+          for tag in latest edge; do
+            docker pull -q "$image:$tag" || { echo "::warning::$image:$tag not found"; continue; }
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" \
+              image --quiet --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL "$image:$tag" || status=1
+          done
+          exit $status

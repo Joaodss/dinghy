@@ -1,3 +1,5 @@
 server/target/
 web/node_modules/
 web/dist/
+deploy/dinghy.env
+deploy/.env
