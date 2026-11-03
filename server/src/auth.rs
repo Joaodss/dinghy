@@ -14,8 +14,6 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use hmac::{Hmac, KeyInit, Mac};
-use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
@@ -24,6 +22,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::AppState;
 use crate::config::AccessConfig;
 use crate::error::AppError;
+use crate::jwt::{self, JwkSet, RsaKey};
 
 pub const SESSION_COOKIE: &str = "dinghy_session";
 pub const CSRF_HEADER: &str = "x-dinghy-csrf";
@@ -165,13 +164,13 @@ impl AccessVerifier {
         format!("https://{}", self.config.team_domain)
     }
 
-    async fn key(&self, kid: &str) -> Result<DecodingKey, String> {
-        if let Some(key) = self.cached_key(kid).await? {
+    async fn key(&self, kid: &str) -> Result<RsaKey, String> {
+        if let Some(key) = self.cached_key(kid).await {
             return Ok(key);
         }
         let _guard = self.refresh.lock().await;
         // Another request may have refreshed the keys while this one waited.
-        if let Some(key) = self.cached_key(kid).await? {
+        if let Some(key) = self.cached_key(kid).await {
             return Ok(key);
         }
         let recently = self
@@ -199,41 +198,22 @@ impl AccessVerifier {
             fetched_at: Instant::now(),
         });
         self.cached_key(kid)
-            .await?
+            .await
             .ok_or_else(|| "unknown signing key".into())
     }
 
-    async fn cached_key(&self, kid: &str) -> Result<Option<DecodingKey>, String> {
-        let cache = self.cache.read().await;
-        match cache.as_ref().and_then(|c| c.keys.find(kid)) {
-            Some(jwk) => DecodingKey::from_jwk(jwk)
-                .map(Some)
-                .map_err(|e| e.to_string()),
-            None => Ok(None),
-        }
+    async fn cached_key(&self, kid: &str) -> Option<RsaKey> {
+        self.cache.read().await.as_ref()?.keys.rsa_key(kid)
     }
 
     /// Returns the signed-in email when the token is valid and the email is allowed.
     pub async fn verify(&self, token: &str) -> Result<String, String> {
-        let header = jsonwebtoken::decode_header(token).map_err(|e| e.to_string())?;
-        if header.alg != Algorithm::RS256 {
-            return Err("unexpected algorithm".into());
-        }
-        let kid = header.kid.ok_or("token has no key id")?;
+        let kid = jwt::key_id(token)?;
         let key = self.key(&kid).await?;
+        let claims: AccessClaims =
+            jwt::verify(token, &key, &self.issuer(), &self.config.aud, now_secs())?;
 
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_audience(&[&self.config.aud]);
-        validation.set_issuer(&[self.issuer()]);
-        validation.set_required_spec_claims(&["exp", "aud", "iss"]);
-        let data = jsonwebtoken::decode::<AccessClaims>(token, &key, &validation)
-            .map_err(|e| e.to_string())?;
-
-        let email = data
-            .claims
-            .email
-            .ok_or("token has no email")?
-            .to_lowercase();
+        let email = claims.email.ok_or("token has no email")?.to_lowercase();
         if self.config.allowed_emails.contains(&email) {
             Ok(email)
         } else {

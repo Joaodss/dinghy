@@ -11,17 +11,20 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
+use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use bollard::Docker;
 use dinghy::auth::AccessVerifier;
 use dinghy::config::Config;
+use dinghy::jwt::JwkSet;
 use dinghy::{AppState, app};
 use http_body_util::BodyExt;
-use jsonwebtoken::jwk::{Jwk, JwkSet};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use ring::rand::SystemRandom;
+use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair, RsaPublicKeyComponents};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-const KEY_PEM: &[u8] = include_bytes!("fixtures/access_test_key.pem");
+const KEY_PEM: &str = include_str!("fixtures/access_test_key.pem");
 const KID: &str = "test-kid";
 const AUD: &str = "test-aud";
 const TEAM: &str = "noodleserver";
@@ -41,9 +44,27 @@ fn now() -> u64 {
         .as_secs()
 }
 
+fn key_pair() -> RsaKeyPair {
+    let der: String = KEY_PEM
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    RsaKeyPair::from_pkcs8(&STANDARD.decode(der).unwrap()).unwrap()
+}
+
+/// The test key as Cloudflare would publish it.
+fn jwks() -> JwkSet {
+    let public = RsaPublicKeyComponents::<Vec<u8>>::from(key_pair().public());
+    serde_json::from_value(json!({ "keys": [{
+        "kty": "RSA", "kid": KID,
+        "n": URL_SAFE_NO_PAD.encode(&public.n), "e": URL_SAFE_NO_PAD.encode(&public.e),
+    }]}))
+    .unwrap()
+}
+
+/// A Cloudflare Access style RS256 token signed with the test key.
 fn token(aud: &str, email: &str, exp: u64) -> String {
-    let mut header = Header::new(Algorithm::RS256);
-    header.kid = Some(KID.into());
+    let header = json!({ "alg": "RS256", "kid": KID, "typ": "JWT" });
     let claims = json!({
         "aud": [aud],
         "iss": format!("https://{TEAM}.cloudflareaccess.com"),
@@ -51,12 +72,21 @@ fn token(aud: &str, email: &str, exp: u64) -> String {
         "exp": exp,
         "iat": now(),
     });
-    jsonwebtoken::encode(
-        &header,
-        &claims,
-        &EncodingKey::from_rsa_pem(KEY_PEM).unwrap(),
+    let input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(header.to_string()),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    let pair = key_pair();
+    let mut sig = vec![0; pair.public().modulus_len()];
+    pair.sign(
+        &RSA_PKCS1_SHA256,
+        &SystemRandom::new(),
+        input.as_bytes(),
+        &mut sig,
     )
-    .unwrap()
+    .unwrap();
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig))
 }
 
 fn valid_token() -> String {
@@ -94,14 +124,7 @@ fn harness() -> Harness {
     })
     .unwrap();
 
-    let mut jwk = Jwk::from_encoding_key(
-        &EncodingKey::from_rsa_pem(KEY_PEM).unwrap(),
-        Algorithm::RS256,
-    )
-    .unwrap();
-    jwk.common.key_id = Some(KID.into());
-    let verifier =
-        AccessVerifier::with_keys(config.access.clone().unwrap(), JwkSet { keys: vec![jwk] });
+    let verifier = AccessVerifier::with_keys(config.access.clone().unwrap(), jwks());
 
     // None of these tests reach Docker; an HTTP client connects lazily, so the
     // tests run without a Docker socket.
