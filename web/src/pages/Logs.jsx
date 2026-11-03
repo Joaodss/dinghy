@@ -1,49 +1,123 @@
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks'
+import { Component } from 'preact'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { stream } from '../api.js'
 
 const MAX_LINES = 5000
+// Lines live in fixed blocks. A full block never changes again, so it is never
+// re-rendered, and the browser skips laying out blocks that are off screen.
+const BLOCK = 250
+const MAX_BLOCKS = MAX_LINES / BLOCK
 
+const pad = (n) => (n < 10 ? '0' : '') + n
+
+/**
+ * Splits Docker's RFC 3339 prefix off a line and shows it as local HH:MM:SS.
+ * Formatting by hand: `toLocaleTimeString` costs ~100 µs a call, which a busy
+ * container turns into most of a second per second.
+ */
 function splitTimestamp(text) {
   const space = text.indexOf(' ')
-  if (space > 0 && /^\d{4}-\d\d-\d\dT/.test(text)) {
-    const date = new Date(text.slice(0, space))
-    if (!isNaN(date)) return [date.toLocaleTimeString([], { hour12: false }), text.slice(space + 1)]
+  if (space > 19 && text[4] === '-' && text[10] === 'T') {
+    const ms = Date.parse(text.slice(0, space))
+    if (!isNaN(ms)) {
+      const d = new Date(ms)
+      return [`${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`, text.slice(space + 1)]
+    }
   }
   return ['', text]
 }
 
-let nextKey = 0
+function toLine(raw) {
+  const [time, text] = splitTimestamp(raw.t)
+  return { err: raw.s === 'e', time, text, lower: text.toLowerCase() }
+}
+
+const matches = (line, needle) => !needle || line.lower.includes(needle)
+
+let nextBlockId = 0
+
+/** Appends lines to the block list, copying only the last block. */
+function appendLines(blocks, lines) {
+  const next = blocks.slice()
+  let i = 0
+  const last = next[next.length - 1]
+  if (last && last.lines.length < BLOCK) {
+    const take = lines.slice(0, BLOCK - last.lines.length)
+    next[next.length - 1] = { id: last.id, lines: last.lines.concat(take) }
+    i = take.length
+  }
+  for (; i < lines.length; i += BLOCK) next.push({ id: nextBlockId++, lines: lines.slice(i, i + BLOCK) })
+  return next.length > MAX_BLOCKS + 1 ? next.slice(next.length - MAX_BLOCKS - 1) : next
+}
+
+class LogBlock extends Component {
+  shouldComponentUpdate(next) {
+    return next.lines !== this.props.lines || next.needle !== this.props.needle
+  }
+
+  render({ lines, needle }) {
+    const shown = needle ? lines.filter((l) => matches(l, needle)) : lines
+    if (!shown.length) return null
+    // Off-screen blocks are sized from their line count until first drawn
+    // (exact unless lines wrap), so the scrollbar stays honest.
+    return (
+      <div class="log-block" style={{ containIntrinsicSize: `auto ${shown.length}lh` }}>
+        {shown.map((l, i) => (
+          <div key={i} class={l.err ? 'line err' : 'line'}>
+            {l.time && <span class="ts">{l.time}</span>}
+            {l.text}
+          </div>
+        ))}
+      </div>
+    )
+  }
+}
 
 export function Logs({ id, name, stack }) {
-  const [lines, setLines] = useState([])
+  const [blocks, setBlocks] = useState([])
   const [status, setStatus] = useState('connecting')
   const [filter, setFilter] = useState('')
   const [paused, setPaused] = useState(false)
+  const [queued, setQueued] = useState(0)
   const [attempt, setAttempt] = useState(0)
   const pausedRef = useRef(false)
-  const pending = useRef([])
+  const queue = useRef([])
+  const frame = useRef(0)
   const box = useRef(null)
   const stick = useRef(true)
 
   pausedRef.current = paused
 
+  // At most one render per animation frame, however fast lines arrive. Hidden
+  // tabs get no frames, so nothing is rendered until the tab is visible again.
+  function schedule() {
+    if (frame.current) return
+    frame.current = requestAnimationFrame(() => {
+      frame.current = 0
+      if (pausedRef.current) {
+        setQueued(Math.min(queue.current.length, MAX_LINES))
+        return
+      }
+      // Only the newest MAX_LINES could ever be shown, so only those are formatted.
+      const lines = queue.current.slice(-MAX_LINES).map(toLine)
+      queue.current = []
+      setQueued(0)
+      if (lines.length) setBlocks((prev) => appendLines(prev, lines))
+    })
+  }
+
   useEffect(() => {
-    setLines([])
-    pending.current = []
+    setBlocks([])
+    queue.current = []
     setStatus('connecting')
     // The server stops reading Docker's log stream as soon as this closes.
     const close = stream(`/api/containers/${encodeURIComponent(id)}/logs?tail=200`, {
       onopen: () => setStatus('live'),
       lines: (data) => {
-        const incoming = JSON.parse(data).map((l) => {
-          const [time, text] = splitTimestamp(l.t)
-          return { key: nextKey++, err: l.s === 'e', time, text }
-        })
-        if (pausedRef.current) {
-          pending.current = pending.current.concat(incoming).slice(-MAX_LINES)
-        } else {
-          setLines((prev) => prev.concat(incoming).slice(-MAX_LINES))
-        }
+        const raw = JSON.parse(data)
+        queue.current = queue.current.length ? queue.current.concat(raw) : raw
+        if (queue.current.length > 2 * MAX_LINES) queue.current = queue.current.slice(-MAX_LINES)
+        schedule()
       },
       end: () => {
         setStatus('ended')
@@ -55,30 +129,34 @@ export function Logs({ id, name, stack }) {
         close()
       },
     })
-    return close
+    return () => {
+      close()
+      cancelAnimationFrame(frame.current)
+      frame.current = 0
+    }
   }, [id, attempt])
 
   useEffect(() => {
-    if (!paused && pending.current.length) {
-      const queued = pending.current
-      pending.current = []
-      setLines((prev) => prev.concat(queued).slice(-MAX_LINES))
-    }
+    if (!paused) schedule()
   }, [paused])
 
-  const visible = useMemo(() => {
-    const needle = filter.trim().toLowerCase()
-    return needle ? lines.filter((l) => l.text.toLowerCase().includes(needle)) : lines
-  }, [lines, filter])
+  const needle = filter.trim().toLowerCase()
+  const anyVisible = useMemo(() => blocks.some((b) => b.lines.some((l) => matches(l, needle))), [blocks, needle])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = box.current
     if (el && stick.current) el.scrollTop = el.scrollHeight
-  }, [visible])
+  }, [blocks, needle])
 
   function onScroll() {
     const el = box.current
     stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  }
+
+  function clear() {
+    queue.current = []
+    setQueued(0)
+    setBlocks([])
   }
 
   return (
@@ -98,18 +176,15 @@ export function Logs({ id, name, stack }) {
         <span class={`badge ${status === 'live' ? 'running' : status === 'connecting' ? 'partial' : 'stopped'}`}>{status}</span>
         <span class="spacer" />
         <input class="filter" type="search" placeholder="Filter" value={filter} onInput={(e) => setFilter(e.target.value)} />
-        <button onClick={() => setPaused((p) => !p)}>{paused ? `Resume (${pending.current.length})` : 'Pause'}</button>
-        <button onClick={() => setLines([])}>Clear</button>
+        <button onClick={() => setPaused((p) => !p)}>{paused ? `Resume (${queued})` : 'Pause'}</button>
+        <button onClick={clear}>Clear</button>
         {(status === 'disconnected' || status === 'ended') && <button onClick={() => setAttempt((a) => a + 1)}>Reconnect</button>}
       </div>
       <div class="console logs" ref={box} onScroll={onScroll}>
-        {visible.map((l) => (
-          <div key={l.key} class={l.err ? 'line err' : 'line'}>
-            {l.time && <span class="ts">{l.time}</span>}
-            {l.text}
-          </div>
+        {blocks.map((b) => (
+          <LogBlock key={b.id} lines={b.lines} needle={needle} />
         ))}
-        {visible.length === 0 && <div class="muted">{filter ? 'No lines match the filter.' : 'No output yet.'}</div>}
+        {!anyVisible && <div class="muted">{needle ? 'No lines match the filter.' : 'No output yet.'}</div>}
       </div>
     </div>
   )

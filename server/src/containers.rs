@@ -339,11 +339,38 @@ pub struct LogsQuery {
     tail: Option<u32>,
 }
 
-#[derive(Serialize)]
-struct LogLine<'a> {
+/// Most Docker log frames merged into one SSE event.
+const LOG_BATCH: usize = 1024;
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct LogLine {
     /// `o` for stdout, `e` for stderr.
-    s: &'a str,
-    t: String,
+    pub s: &'static str,
+    pub t: String,
+}
+
+/// Unfinished lines per stream, carried between Docker frames.
+#[derive(Default)]
+pub struct LineBuffers {
+    out: String,
+    err: String,
+}
+
+impl LineBuffers {
+    pub fn push(&mut self, output: LogOutput, lines: &mut Vec<LogLine>) {
+        let (kind, pending, message) = match output {
+            LogOutput::StdErr { message } => ("e", &mut self.err, message),
+            LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                ("o", &mut self.out, message)
+            }
+            LogOutput::StdIn { .. } => return,
+        };
+        lines.extend(
+            split_lines(pending, &String::from_utf8_lossy(&message))
+                .into_iter()
+                .map(|t| LogLine { s: kind, t }),
+        );
+    }
 }
 
 /// Splits a log chunk into complete lines, keeping any unfinished line in `pending`.
@@ -383,31 +410,36 @@ pub async fn container_logs(
         .build();
     let logs = state.docker.logs(&id, Some(options));
 
+    // Docker sends roughly one frame per write. `ready_chunks` groups the frames
+    // that are already waiting into one event, so a quiet container still gets
+    // each line at once while a busy one sends a few large events instead of
+    // thousands of tiny ones.
     let events = logs
-        .scan((String::new(), String::new()), |(out, err), item| {
-            let event = match item {
-                Ok(output) => {
-                    let (kind, pending, message) = match output {
-                        LogOutput::StdErr { message } => ("e", &mut *err, message),
-                        LogOutput::StdOut { message } | LogOutput::Console { message } => {
-                            ("o", &mut *out, message)
-                        }
-                        LogOutput::StdIn { .. } => return std::future::ready(Some(None)),
-                    };
-                    let lines: Vec<LogLine> =
-                        split_lines(pending, &String::from_utf8_lossy(&message))
-                            .into_iter()
-                            .map(|t| LogLine { s: kind, t })
-                            .collect();
-                    (!lines.is_empty())
-                        .then(|| Event::default().event("lines").json_data(lines).ok())
-                        .flatten()
+        .ready_chunks(LOG_BATCH)
+        .scan(LineBuffers::default(), |buffers, batch| {
+            let mut events = Vec::with_capacity(2);
+            let mut lines = Vec::new();
+            let mut error = None;
+            for item in batch {
+                match item {
+                    Ok(output) => buffers.push(output, &mut lines),
+                    Err(e) => {
+                        error = Some(e.to_string());
+                        break;
+                    }
                 }
-                Err(e) => Some(Event::default().event("error").data(e.to_string())),
-            };
-            std::future::ready(Some(event))
+            }
+            if !lines.is_empty()
+                && let Ok(event) = Event::default().event("lines").json_data(&lines)
+            {
+                events.push(event);
+            }
+            if let Some(e) = error {
+                events.push(Event::default().event("error").data(e));
+            }
+            std::future::ready(Some(stream::iter(events.into_iter().map(Ok))))
         })
-        .filter_map(|event| std::future::ready(event.map(Ok)))
+        .flatten()
         .chain(stream::once(std::future::ready(Ok(Event::default()
             .event("end")
             .data("")))));
@@ -517,6 +549,39 @@ mod tests {
         assert_eq!(split_lines(&mut pending, "a\nb"), vec!["a"]);
         assert_eq!(split_lines(&mut pending, "c\r\nd\n"), vec!["bc", "d"]);
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn merges_frames_per_stream() {
+        let frame = |s: &'static str| axum::body::Bytes::from_static(s.as_bytes());
+        let mut buffers = LineBuffers::default();
+        let mut lines = Vec::new();
+        buffers.push(
+            LogOutput::StdOut {
+                message: frame("a\nb"),
+            },
+            &mut lines,
+        );
+        buffers.push(
+            LogOutput::StdErr {
+                message: frame("oops\n"),
+            },
+            &mut lines,
+        );
+        buffers.push(
+            LogOutput::StdOut {
+                message: frame("c\n"),
+            },
+            &mut lines,
+        );
+        buffers.push(
+            LogOutput::StdIn {
+                message: frame("ignored\n"),
+            },
+            &mut lines,
+        );
+        let line = |s, t: &str| LogLine { s, t: t.into() };
+        assert_eq!(lines, [line("o", "a"), line("e", "oops"), line("o", "bc")]);
     }
 
     #[test]

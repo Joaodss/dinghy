@@ -319,6 +319,9 @@ th {
   flex: 1;
   min-height: 12rem;
 }
+.log-block {
+  content-visibility: auto;
+}
 .logs .line.err {
   color: var(--console-err);
 }

@@ -19,8 +19,12 @@ while an action is running. Logs stream only while their page is open.
   `docker compose -p <stack> -f <file> …` and stream its output; the output
   is dropped two minutes after the command ends.
 - **Logs**: the last 200 lines, then follow, over Server-Sent Events. The
-  filter and pause run in the browser. Closing the page closes the Docker log
-  stream.
+  filter and pause run in the browser, which keeps the newest 5,000 lines.
+  Closing the page closes the Docker log stream. Nothing is buffered on the
+  server: Docker already stores the logs, and `tail` reads them on demand.
+  Busy containers stay smooth: the server groups waiting lines into one
+  event, and the page draws at most once per frame, skipping off-screen
+  lines.
 - **Files**: a tree of the configured roots and a CodeMirror editor. Saves are
   atomic (temp file + rename) and refused with `412` if the file changed since
   it was opened. `.env` values are masked until you press **Show values**, and
@@ -191,7 +195,7 @@ web/      Preact + Vite; CodeMirror 6 loads only on the Files page
 ```
 
 ```bash
-cd web && npm ci && npm run build      # the server embeds web/dist
+cd web && npm ci && npm run build      # also writes .br/.gz copies; the server embeds web/dist
 cd server && cargo test
 ```
 
