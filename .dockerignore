@@ -1,0 +1,6 @@
+.git
+.github
+.claude
+**/target
+**/node_modules
+web/dist
