@@ -9,7 +9,7 @@ COPY web/ ./
 RUN npm run build
 
 # --- Server (static musl binary with the frontend embedded) ---------------
-FROM rust:1.99-alpine AS server
+FROM rust:1.100-alpine AS server
 RUN apk add --no-cache musl-dev gcc
 WORKDIR /src/server
 # Build dependencies first so they are cached across source changes.
