@@ -21,7 +21,7 @@ COPY --from=web /src/web/dist /src/web/dist
 RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 # --- Docker Compose CLI (standalone; tracked by Dependabot) ----------------
-FROM docker/compose-bin:v5.7.0 AS compose
+FROM docker/compose-bin:v5.8.0 AS compose
 
 # --- Bare binary, for release downloads (`--target binary`) ---------------
 FROM scratch AS binary
